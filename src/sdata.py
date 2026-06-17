@@ -1,1 +1,0 @@
-"""Entrypoint to run BgNorm on SpatialData objects (Image2DModels only)."""

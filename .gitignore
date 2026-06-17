@@ -11,3 +11,9 @@ wheels/
 
 # tests
 .pytest_cache
+
+# dev/prototyping
+__dev*
+
+# data
+*.zarr

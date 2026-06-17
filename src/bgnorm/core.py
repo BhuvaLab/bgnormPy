@@ -119,7 +119,6 @@ class ArcsinhTransform(BaseEstimator, TransformerMixin):
     def transform(self, X: ImageLike) -> ImageLike:
         return _rewrap(X, da.arcsinh(_as_dask(X) / self.cofactor))
 
-
 class BgNormChannel(BaseEstimator, TransformerMixin):
     """
     BGNorm method on one channel.
