@@ -1,12 +1,13 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from bgnorm.src.core import (
+from .core import (
     ArcsinhTransform,
     BgNormArrays,
     BgNormChannel,
     BgNormConfig,
     ImageLike,
     Log2Transform,
+    Log10Transform,
     MedianFilter,
     Moments,
     PostHocQuantile,
@@ -14,6 +15,17 @@ from bgnorm.src.core import (
     bgnorm,
     default_pipeline,
 )
+from .io import (
+    ImageLikeSchema,
+    as_image_matrix,
+    from_numpy,
+    from_png,
+    from_qptiff,
+    from_spatialdata,
+    from_tiff,
+)
+from .plotting import ChannelPlotContext, ImageGridContext
+from .tracking import MLflowTracker, TrackingConfig
 
 try:
     __version__ = version("bgnorm")
@@ -25,12 +37,24 @@ __all__ = [
     "BgNormArrays",
     "BgNormChannel",
     "BgNormConfig",
+    "ChannelPlotContext",
+    "ImageGridContext",
     "ImageLike",
+    "ImageLikeSchema",
     "Log2Transform",
+    "Log10Transform",
     "MedianFilter",
+    "MLflowTracker",
     "Moments",
     "PostHocQuantile",
     "ScoreMetrics",
+    "TrackingConfig",
+    "as_image_matrix",
     "bgnorm",
     "default_pipeline",
+    "from_numpy",
+    "from_png",
+    "from_qptiff",
+    "from_spatialdata",
+    "from_tiff",
 ]

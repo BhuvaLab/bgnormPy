@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, TypedDict
 
@@ -13,6 +14,9 @@ from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.mixture import GaussianMixture
 from sklearn.pipeline import Pipeline
 import xarray as xr
+
+from .io import ImageLikeSchema, as_image_matrix
+from .tracking import MLflowTracker, TrackingConfig
 
 # type helpers
 ImageLike = xr.DataArray | np.ndarray | da.Array
@@ -30,7 +34,7 @@ class BgNormConfig(BaseModel):
     n_pixels_to_sample: int = Field(int(1e5), ge=1, description="Pixels sampled to fit the GMM.")
     pixel_sampling_seed: int = Field(0, ge=0, description="Seed for pixel sampling.")
     quantile_post_hoc_value: float | None = Field(
-        None, gt=0, lt=1, description="If set, append PostHocQuantile(q); else omit it."
+        0.75, gt=0, lt=1, description="If set, append PostHocQuantile(q); else omit it."
     )
 
 
@@ -52,6 +56,8 @@ class Moments(TypedDict):
 class ScoreMetrics(TypedDict):
     """Per-channel goodness-of-fit metrics."""
     cohens_d: float
+    jsd: float            # equal-weight JSD of signal vs background components, [0, 1]
+    jsd_weighted: float   # GMM-weight-mixed JSD (prevalence-aware), bounded by H(w)
     bic: float
     log_likelihood: float
     signal_weight: float
@@ -81,6 +87,49 @@ def _rewrap(X: ImageLike, data, attrs: dict | None = None) -> ImageLike:
         return data
     return np.asarray(data)
 
+
+def _gaussian_grid(
+    mu1: float, var1: float, mu2: float, var2: float, n_grid: int = 2000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Integration grid + the two component pdfs, spanning ±6σ of both Gaussians.
+    Computed once so several weightings can share it (the pdfs depend only on the
+    fitted means/variances, not on the mixing weights)."""
+    sd1, sd2 = np.sqrt(var1), np.sqrt(var2)
+    lo = min(mu1 - 6 * sd1, mu2 - 6 * sd2)
+    hi = max(mu1 + 6 * sd1, mu2 + 6 * sd2)
+    x = np.linspace(lo, hi, n_grid)
+    return x, stats.norm.pdf(x, mu1, sd1), stats.norm.pdf(x, mu2, sd2)
+
+
+def _jsd_from_pdfs(
+    x: np.ndarray, p: np.ndarray, q: np.ndarray, w1: float = 0.5, w2: float = 0.5,
+) -> float:
+    """Jensen-Shannon divergence (base 2) of two pdfs sampled on grid `x`, mixed
+    with weights (w1, w2). Equal weights for symmetric JSD in [0, 1]; 
+    """
+    w1, w2 = w1 / (w1 + w2), w2 / (w1 + w2)
+    mix = w1 * p + w2 * q
+
+    def _kl(a: np.ndarray) -> float:
+        terms = np.zeros_like(a)
+        mask = a > 0
+        terms[mask] = a[mask] * np.log2(a[mask] / mix[mask])
+        return float(np.trapezoid(terms, x))
+
+    return w1 * _kl(p) + w2 * _kl(q)
+
+
+def _gaussian_jsd(
+    mu1: float, var1: float, mu2: float, var2: float,
+    w1: float = 0.5, w2: float = 0.5, n_grid: int = 2000,
+) -> float:
+    """Jensen-Shannon divergence (base 2) between two 1-D Gaussians (no closed form,
+    so integrated on a shared grid). Thin wrapper over `_gaussian_grid` +
+    `_jsd_from_pdfs`; `score()` builds the grid once and reuses it for both the
+    equal-weight and prevalence-weighted JSD."""
+    x, p, q = _gaussian_grid(mu1, var1, mu2, var2, n_grid)
+    return _jsd_from_pdfs(x, p, q, w1, w2)
+
 class MedianFilter(BaseEstimator, TransformerMixin):
     """radiusxradius (one-connectivity) square median filter over a single channel. """
 
@@ -108,6 +157,20 @@ class Log2Transform(BaseEstimator, TransformerMixin):
     def transform(self, X: ImageLike) -> ImageLike:
         return _rewrap(X, da.log2(_as_dask(X) / self.cofactor + 1))
 
+class Log10Transform(BaseEstimator, TransformerMixin):
+    """log10(X / cofactor + 1) scalar transform"""
+
+    def __init__(self, cofactor: int = 150) -> None:
+        self.cofactor = cofactor
+
+    def fit(self, X: ImageLike, y: None = None) -> Log10Transform:
+        if self.cofactor < 1:
+            raise ValueError("Cofactor must be 1 or greater")
+        return self
+
+    def transform(self, X: ImageLike) -> ImageLike:
+        return _rewrap(X, da.log10(_as_dask(X) / self.cofactor + 1))
+
 class ArcsinhTransform(BaseEstimator, TransformerMixin):
     """Arcsinh transform with cofactor"""
     def __init__(self, cofactor: int = 150) -> None:
@@ -125,7 +188,8 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
 
     .fit(X); fits the conv of gaussians using GMMs
     .transform(X); returns adjusted DataArray
-    .score(X); metrics of goodness fits {cohens_d, bic, log_likelihood, signal_weight}.
+    .score(X); metrics of goodness fits
+        {cohens_d, jsd, jsd_weighted, bic, log_likelihood, signal_weight}.
     """
 
     # fitted attributes (set in fit/transform), declared for type checkers
@@ -169,7 +233,11 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
         rng = np.random.default_rng(self.pixel_sampling_seed)
         sample = rng.choice(positive, int(nsample), replace=False)
 
-        gmm = GaussianMixture(n_components=self.n_components, covariance_type="full")
+        gmm = GaussianMixture(
+            n_components=self.n_components, 
+            covariance_type="full",
+            init_params="k-means++"
+        )
         gmm.fit(sample.reshape(-1, 1))
 
         # reorder components by mean (ascending)
@@ -238,9 +306,22 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
         m = self.moments_
         pooled_sd = np.sqrt((m["var_signal"] + m["var_background"]) / 2)
         cohens_d = (m["mean_signal"] - m["mean_background"]) / pooled_sd
+        # JSD between the same two components cohens_d compares (signal vs the
+        # tissue-background component): a bounded [0, 1], overlap-aware alternative.
+        # `jsd` is prevalence-agnostic (like cohens_d); `jsd_weighted` mixes by the
+        # GMM component weights, down-weighting a separable-but-rare signal peak.
+        w_background = float(self.gmm_.weights_[self.background_component_])
+        # build the integration grid + component pdfs once, reuse for both weightings
+        x, p, q = _gaussian_grid(
+            m["mean_signal"], m["var_signal"], m["mean_background"], m["var_background"]
+        )
+        jsd = _jsd_from_pdfs(x, p, q)
+        jsd_weighted = _jsd_from_pdfs(x, p, q, w1=m["weight_signal"], w2=w_background)
         s = self.sample_.reshape(-1, 1)
         return {
             "cohens_d": float(cohens_d),
+            "jsd": float(jsd),
+            "jsd_weighted": float(jsd_weighted),
             "bic": float(self.gmm_.bic(s)),
             "log_likelihood": float(self.gmm_.score(s)),
             "signal_weight": float(m["weight_signal"]),
@@ -306,68 +387,80 @@ def default_pipeline(config: BgNormConfig | None = None, **overrides: object) ->
     return Pipeline(steps)
 
 
-def _coerce(image: ImageLike, channel_dim: str) -> tuple[xr.DataArray, bool, bool]:
-    """Normalise any supported input to a (channel_dim, y, x) DataArray.
-
-    Accepts xr.DataArray (with or without a channel dim) or an array-like
-    (numpy/dask) of shape (y, x) or (c, y, x). Returns
-    (DataArray, was_xarray, was_single_channel) so the caller can return output
-    in the same flavour/rank the user gave.
-    """
-    if isinstance(image, xr.DataArray):
-        if channel_dim in image.dims:
-            return image, True, False
-        return image.expand_dims(channel_dim), True, True  # 2D DataArray
-
-    arr = image  # numpy or dask array
-    if arr.ndim == 2:
-        arr, single = arr[None], True # (y, x) -> (1, y, x); need c dim
-    elif arr.ndim == 3:
-        single = arr.shape[0] == 1
-    else:
-        raise ValueError(f"Expected 2D (y, x) or 3D (c, y, x) array, got ndim={arr.ndim}")
-    da_img = xr.DataArray(
-        arr,
-        dims=(channel_dim, "y", "x"),
-        coords={channel_dim: np.arange(arr.shape[0])},
-    )
-    return da_img, False, single
-
-
 @dataclass
 class BgNormArrays:
-    """Plain-array result returned when the caller passes a numpy/dask image."""
+    """Plain-array result returned when the caller passes a numpy/dask image.
+
+    `adjusted` is the bgnorm output; `adjusted_post_hoc` is the quantile-normalised
+    output (None unless a PostHocQuantile step ran).
+    """
     adjusted: np.ndarray
     labels: np.ndarray
     probs: np.ndarray
     summaries: pd.DataFrame
+    adjusted_post_hoc: np.ndarray | None = None
 
-# function entrypoint
+def _build_tracker(
+    tracking: TrackingConfig,
+    image: xr.DataArray,
+    pipeline: Pipeline,
+) -> MLflowTracker:
+    """Resolve the experiment image name (explicit > DataArray.name > "image")
+    and construct the MLflow tracker. `pipeline` is a representative (unfitted)
+    composition; the tracker logs its steps/params as the parent parameter setting."""
+    name = tracking.image_name
+    if name is None and isinstance(image, xr.DataArray) and image.name is not None:
+        name = str(image.name)
+    return MLflowTracker(tracking, image_name=name or "image", pipeline=pipeline)
+
+
 def bgnorm(
     image: ImageLike,
     pipeline: Pipeline | None = None,
     channel_dim: str = "c",
     config: BgNormConfig | None = None,
+    *,
+    tracking: TrackingConfig | None = None,
     **overrides: object,
 ) -> tuple[xr.Dataset, pd.DataFrame] | BgNormArrays:
     """Background-normalise a single- or multi-channel image.
 
     `image` may be an xr.DataArray ((c, y, x) or (y, x)) or a numpy/dask array
-    of shape (y, x) or (c, y, x). Pass a custom `pipeline=` to run an experiment
-    composition; otherwise a `default_pipeline` is built from `config=` / keyword
-    overrides (validated via BgNormConfig).
+    of shape (y, x) or (c, y, x). It is parsed into the canonical bgnorm image
+    matrix and validated via `io.as_image_matrix` / `ImageLikeSchema`. Pass a
+    custom `pipeline=` to run an experiment composition; otherwise a
+    `default_pipeline` is built from `config=` / keyword overrides.
+
+    Pass `tracking=TrackingConfig(...)` to log to MLflow: a parent run per
+    parameter setting, with one nested run per channel carrying its ScoreMetrics.
 
     Returns (xr.Dataset, summaries) for DataArray input, or a BgNormArrays for
     array input (rank matched to what was passed in).
     """
-    da_img, was_xarray, single = _coerce(image, channel_dim)
+    was_xarray = isinstance(image, xr.DataArray)
+    name = tracking.image_name if tracking is not None else None
+    da_img = as_image_matrix(image, channel_dim=channel_dim, name=name)
+    single = int(da_img.sizes[channel_dim]) == 1
     cfg = _resolve_config(config, overrides)
     make_pipeline: PipelineFactory = (
         (lambda: pipeline) if pipeline is not None
         else (lambda: default_pipeline(cfg))
     )
-    merged, summaries = _run_per_channel(da_img, make_pipeline, channel_dim)
-    summaries = pd.DataFrame.from_dict(summaries, orient="index")
+    # Probe the composition once (unfitted) so the tracker can record which
+    # transforms run; per-channel pipelines are still cloned fresh below.
+    tracker = (
+        _build_tracker(tracking, da_img, make_pipeline())
+        if tracking is not None
+        else None
+    )
+    with (tracker or nullcontext()):
+        merged, summaries, transformed = _run_per_channel(
+            da_img, make_pipeline, channel_dim, tracker
+        )
+        summaries = pd.DataFrame.from_dict(summaries, orient="index")
+        if tracker is not None:
+            tracker.log_summary(summaries)
+            tracker.log_grids(da_img, transformed, merged, channel_dim)
 
     if was_xarray:
         return (merged.isel({channel_dim: 0}) if single else merged), summaries
@@ -375,28 +468,78 @@ def bgnorm(
     adjusted = np.asarray(merged["adjusted_image"].data)
     labels = np.asarray(merged["labels"].data)
     probs = np.asarray(merged["probs"].data)
+    post_hoc = (
+        np.asarray(merged["adjusted_image_post_hoc"].data)
+        if "adjusted_image_post_hoc" in merged else None
+    )
     if single:  # caller gave (y, x) -> hand back without the channel axis
         adjusted, labels, probs = adjusted[0], labels[0], probs[0]
-    return BgNormArrays(adjusted, labels, probs, summaries)
+        if post_hoc is not None:
+            post_hoc = post_hoc[0]
+    return BgNormArrays(adjusted, labels, probs, summaries, post_hoc)
+
+
+def _pre_bgnorm_transform(pipe: Pipeline, bgnorm_step: BgNormChannel, X: xr.DataArray) -> xr.DataArray:
+    """Replay the fitted pre-bgnorm transformers (e.g. median, log2) on X — i.e.
+    the channel as the GMM actually saw it. Stateless transforms, so just chaining
+    their `.transform` reproduces the bgnorm step's input."""
+    out = X
+    for _, est in pipe.steps:
+        if est is bgnorm_step:
+            break
+        out = est.transform(out)
+    return out
 
 
 def _run_per_channel(
     image: xr.DataArray,
     make_pipeline: PipelineFactory,
     channel_dim: str,
-) -> tuple[xr.Dataset, dict[object, dict[str, float]]]:
-    """Fit one (cloned) pipeline per channel and reassemble. This is the seam
-    for dispatching C parallel jobs + opening/closing nested MLflow runs."""
-    datasets, summaries = [], {}
+    tracker: MLflowTracker | None = None,
+) -> tuple[xr.Dataset, dict[object, dict[str, float]], xr.DataArray | None]:
+    """Fit one cloned pipeline per channel and reassemble. 
+    Pipeline cloned for parallel dispatch (TODO)
+
+    If mlflow tracker is provided, also collects the per-channel transformed image
+    (post median+log2, pre bgnorm) into a (c, y, x) DataArray for the image grids;
+    returns None otherwise"""
+    # enforce the canonical (channel_dim, y, x) image matrix at the compute seam
+    image = ImageLikeSchema.validate(image, channel_dim=channel_dim)
+    datasets, summaries, transformed = [], {}, []
+    signal_comps, background_comps = [], []  # per-channel role assignment (mean-sorted idx)
     for ci, ch_name in enumerate(image[channel_dim].values):
         ch = image.isel({channel_dim: ci}) # (y, x) slice, retains scalar `c` coord
         ydim, xdim = ch.dims
 
-        pipe = clone(make_pipeline())
-        adjusted = pipe.fit_transform(ch) # DataArray (post-hoc applied if in pipe)
-        bg = pipe.named_steps["bgnorm"]
+        with (tracker.channel(ch_name) if tracker is not None else nullcontext()):
+            pipe = clone(make_pipeline())
+            adjusted_final = pipe.fit_transform(ch)  # bgnorm, + posthoc quantile if in pipe
+            bg = pipe.named_steps["bgnorm"]
 
-        summaries[ch_name] = {**bg.moments_, **bg.score()}
+            metrics = {**bg.moments_, **bg.score()}
+            summaries[ch_name] = metrics
+            signal_comps.append(int(bg.signal_component_))
+            background_comps.append(int(bg.background_component_))
+
+            has_posthoc = any(isinstance(est, PostHocQuantile) for _, est in pipe.steps)
+            # the GMM input (median+log): needed for the grids, and to recover the
+            # pre-quantile bgnorm image when a posthoc step is present.
+            xformed = (
+                _pre_bgnorm_transform(pipe, bg, ch)
+                if (tracker is not None or has_posthoc) else None
+            )
+            if has_posthoc:
+                adjusted_image = bg.transform(xformed)  # bgnorm (pre-quantile)
+                adjusted_post_hoc = adjusted_final      # bgnormQ
+            else:
+                adjusted_image = adjusted_final
+                adjusted_post_hoc = None
+
+            if tracker is not None:
+                tracker.log_channel(
+                    ch_name, ch, xformed, adjusted_image, adjusted_post_hoc, bg, metrics, pipe
+                )
+                transformed.append(xformed)
 
         # probabilities_: (y, x, n_components) -> (n_components, y, x); carry the
         # channel scalar coord + spatial coords so xr.concat aligns per channel.
@@ -409,15 +552,21 @@ def _run_per_channel(
                 channel_dim: ch.coords[channel_dim],
             },
         )
-        datasets.append(
-            xr.Dataset(
-                {
-                    "adjusted_image": adjusted,
-                    "labels": ch.copy(data=bg.labels_),
-                    "probs": probs,
-                }
-            )
-        )
+        data_vars = {
+            "adjusted_image": adjusted_image,
+            "labels": ch.copy(data=bg.labels_),
+            "probs": probs,
+        }
+        if adjusted_post_hoc is not None:
+            data_vars["adjusted_image_post_hoc"] = adjusted_post_hoc
+        datasets.append(xr.Dataset(data_vars))
 
     merged = xr.concat(datasets, dim=channel_dim)
-    return merged, summaries
+    # which mean-sorted GMM component is signal vs (tissue) background per channel —
+    # the assignment can flip per channel, so carry it for role-correct plotting.
+    merged = merged.assign_coords(
+        signal_component=(channel_dim, np.array(signal_comps, dtype=int)),
+        background_component=(channel_dim, np.array(background_comps, dtype=int)),
+    )
+    transformed_da = xr.concat(transformed, dim=channel_dim) if transformed else None
+    return merged, summaries, transformed_da

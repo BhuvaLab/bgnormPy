@@ -16,6 +16,15 @@ dependencies = [
     "xarray>=2026.4.0",
 ]
 
+[project.optional-dependencies]
+mlflow = ["mlflow>=2.12", "matplotlib>=3.7"]
+io = ["pillow>=10", "tifffile>=2023.7.10"]
+spatialdata = ["spatialdata>=0.2", "anndata>=0.10"]
+qptiff = [
+    "bioio>=1.0",
+    "bioio-tifffile @ git+https://github.com/rtubelleza/bioio-tifffile.git@feature/read-qptiffs-rich-reduce-ome",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
