@@ -29,7 +29,7 @@ from .tracking import MLflowTracker, TrackingConfig
 
 try:
     __version__ = version("bgnorm")
-except PackageNotFoundError:  # not installed (e.g. running from source tree)
+except PackageNotFoundError:
     __version__ = "0.0.0"
 
 __all__ = [

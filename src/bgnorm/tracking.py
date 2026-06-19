@@ -62,9 +62,6 @@ class TrackingConfig(BaseModel):
     """Longest-edge size each channel thumbnail is downsampled to in the grids."""
 
 
-# Salient param folded into the run-name tag, keyed by step class name so this
-# module never has to import (and risk a cycle with) bgnorm.core. Steps not listed
-# contribute just their pipeline name, so custom/omitted steps still read clearly.
 _STEP_TAG = {
     "MedianFilter": lambda s: f"med{s.radius}",
     "Log2Transform": lambda s: f"log2c{s.cofactor}",

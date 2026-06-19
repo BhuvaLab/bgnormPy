@@ -54,13 +54,18 @@ class Moments(TypedDict):
 
 
 class ScoreMetrics(TypedDict):
-    """Per-channel goodness-of-fit metrics."""
+    """Per-channel goodness-of-fit + method-validity metrics.
+    """
     cohens_d: float
-    jsd: float            # equal-weight JSD of signal vs background components, [0, 1]
-    jsd_weighted: float   # GMM-weight-mixed JSD (prevalence-aware), bounded by H(w)
+    jsd: float           
     bic: float
     log_likelihood: float
-    signal_weight: float
+    signal_weight: float          
+    mean_gap: float           
+    rho: float                
+    conv_violated: float      
+    signal_var_fraction: float 
+    adjustment_scale: float  
 
 
 def _values(X: ImageLike) -> np.ndarray | da.Array:
@@ -91,9 +96,7 @@ def _rewrap(X: ImageLike, data, attrs: dict | None = None) -> ImageLike:
 def _gaussian_grid(
     mu1: float, var1: float, mu2: float, var2: float, n_grid: int = 2000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Integration grid + the two component pdfs, spanning ±6σ of both Gaussians.
-    Computed once so several weightings can share it (the pdfs depend only on the
-    fitted means/variances, not on the mixing weights)."""
+    """Integration grid + the two component pdfs"""
     sd1, sd2 = np.sqrt(var1), np.sqrt(var2)
     lo = min(mu1 - 6 * sd1, mu2 - 6 * sd2)
     hi = max(mu1 + 6 * sd1, mu2 + 6 * sd2)
@@ -119,16 +122,15 @@ def _jsd_from_pdfs(
     return w1 * _kl(p) + w2 * _kl(q)
 
 
-def _gaussian_jsd(
-    mu1: float, var1: float, mu2: float, var2: float,
-    w1: float = 0.5, w2: float = 0.5, n_grid: int = 2000,
-) -> float:
-    """Jensen-Shannon divergence (base 2) between two 1-D Gaussians (no closed form,
-    so integrated on a shared grid). Thin wrapper over `_gaussian_grid` +
-    `_jsd_from_pdfs`; `score()` builds the grid once and reuses it for both the
-    equal-weight and prevalence-weighted JSD."""
-    x, p, q = _gaussian_grid(mu1, var1, mu2, var2, n_grid)
-    return _jsd_from_pdfs(x, p, q, w1, w2)
+# def _gaussian_jsd(
+#     mu1: float, var1: float, mu2: float, var2: float,
+#     w1: float = 0.5, w2: float = 0.5, n_grid: int = 2000,
+# ) -> float:
+#     """Jensen-Shannon divergence (base 2) between two 1-D Gaussians (no closed form,
+#     so integrated on a shared grid)."""
+#     x, p, q = _gaussian_grid(mu1, var1, mu2, var2, n_grid)
+#     return _jsd_from_pdfs(x, p, q, w1, w2)
+
 
 class MedianFilter(BaseEstimator, TransformerMixin):
     """radiusxradius (one-connectivity) square median filter over a single channel. """
@@ -188,8 +190,9 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
 
     .fit(X); fits the conv of gaussians using GMMs
     .transform(X); returns adjusted DataArray
-    .score(X); metrics of goodness fits
-        {cohens_d, jsd, jsd_weighted, bic, log_likelihood, signal_weight}.
+    .score(X); goodness-of-fit + method-validity metrics
+        {cohens_d, jsd, bic, log_likelihood, signal_weight,
+         mean_gap, rho, conv_violated, signal_var_fraction, adjustment_scale}.
     """
 
     # fitted attributes (set in fit/transform), declared for type checkers
@@ -234,17 +237,19 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
         sample = rng.choice(positive, int(nsample), replace=False)
 
         gmm = GaussianMixture(
-            n_components=self.n_components, 
+            n_components=self.n_components,
             covariance_type="full",
-            init_params="k-means++"
+            init_params="k-means++",
+            random_state=42, 
         )
         gmm.fit(sample.reshape(-1, 1))
 
-        # reorder components by mean (ascending)
+        # reorder components by mean (ascending). 
         order = np.argsort(gmm.means_.flatten())
         gmm.means_ = gmm.means_[order]
         gmm.covariances_ = gmm.covariances_[order]
         gmm.weights_ = gmm.weights_[order]
+        gmm.precisions_cholesky_ = gmm.precisions_cholesky_[order]
 
         # decide which of the top-two components is signal vs background by
         # comparing densities at the 0.99 quantile of the top component
@@ -305,26 +310,28 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
     def score(self, X: xr.DataArray | None = None) -> ScoreMetrics:
         m = self.moments_
         pooled_sd = np.sqrt((m["var_signal"] + m["var_background"]) / 2)
-        cohens_d = (m["mean_signal"] - m["mean_background"]) / pooled_sd
-        # JSD between the same two components cohens_d compares (signal vs the
-        # tissue-background component): a bounded [0, 1], overlap-aware alternative.
-        # `jsd` is prevalence-agnostic (like cohens_d); `jsd_weighted` mixes by the
-        # GMM component weights, down-weighting a separable-but-rare signal peak.
-        w_background = float(self.gmm_.weights_[self.background_component_])
-        # build the integration grid + component pdfs once, reuse for both weightings
+        mean_gap = float(m["mean_signal"] - m["mean_background"])
+        cohens_d = mean_gap / pooled_sd
+
         x, p, q = _gaussian_grid(
             m["mean_signal"], m["var_signal"], m["mean_background"], m["var_background"]
         )
         jsd = _jsd_from_pdfs(x, p, q)
-        jsd_weighted = _jsd_from_pdfs(x, p, q, w1=m["weight_signal"], w2=w_background)
         s = self.sample_.reshape(-1, 1)
+
+
+        rho = float(self.rho_)
         return {
             "cohens_d": float(cohens_d),
             "jsd": float(jsd),
-            "jsd_weighted": float(jsd_weighted),
             "bic": float(self.gmm_.bic(s)),
             "log_likelihood": float(self.gmm_.score(s)),
             "signal_weight": float(m["weight_signal"]),
+            "mean_gap": mean_gap,
+            "rho": rho,
+            "conv_violated": float(rho < 0),
+            "signal_var_fraction": float(1.0 - rho),
+            "adjustment_scale": mean_gap * float(m["weight_signal"]),
         }
 
 class PostHocQuantile(BaseEstimator, TransformerMixin):
@@ -481,8 +488,7 @@ def bgnorm(
 
 def _pre_bgnorm_transform(pipe: Pipeline, bgnorm_step: BgNormChannel, X: xr.DataArray) -> xr.DataArray:
     """Replay the fitted pre-bgnorm transformers (e.g. median, log2) on X — i.e.
-    the channel as the GMM actually saw it. Stateless transforms, so just chaining
-    their `.transform` reproduces the bgnorm step's input."""
+    the channel as the GMM actually saw it."""
     out = X
     for _, est in pipe.steps:
         if est is bgnorm_step:
@@ -530,7 +536,7 @@ def _run_per_channel(
             )
             if has_posthoc:
                 adjusted_image = bg.transform(xformed)  # bgnorm (pre-quantile)
-                adjusted_post_hoc = adjusted_final      # bgnormQ
+                adjusted_post_hoc = adjusted_final # bgnormQ
             else:
                 adjusted_image = adjusted_final
                 adjusted_post_hoc = None

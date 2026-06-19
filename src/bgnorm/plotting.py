@@ -21,13 +21,13 @@ class ChannelPlotContext:
 
     channel: str
     image: xr.DataArray
-    transformed: xr.DataArray  # post pre-bgnorm transforms, the GMM's input
-    adjusted: xr.DataArray     # bgnorm output (pre-quantile)
+    transformed: xr.DataArray # post pre-bgnorm transforms, the GMM's input
+    adjusted: xr.DataArray # bgnorm output (pre-quantile)
     model: BgNormChannel
     metrics: dict[str, float]
     pipeline: Pipeline
-    adjusted_q: xr.DataArray | None = None  # bgnormQ output (None without posthoc)
-    transform_label: str = "transformed"  # the actual pre-bgnorm transforms, e.g. "median + log10"
+    adjusted_q: xr.DataArray | None = None # bgnormQ output (None without posthoc)
+    transform_label: str = "transformed" # the actual pre-bgnorm transforms, e.g. "median + log10"
 
 
 @dataclass
@@ -36,31 +36,25 @@ class ImageGridContext:
     (channel_dim, y, x) DataArray; `probs` is (..., channel_dim, ..., y, x) with a
     `{channel_dim}_probs` axis of length `n_components`."""
 
-    raw: xr.DataArray          # raw, untransformed input, (c, y, x)
-    transformed: xr.DataArray | None  # post pre-bgnorm transforms (None if not collected)
-    bgnorm: xr.DataArray       # bgnorm output (pre-quantile), (c, y, x)
-    bgnorm_q: xr.DataArray | None  # bgnormQ output (None without posthoc)
-    labels: xr.DataArray       # argmax mean-sorted component id, (c, y, x)
-    probs: xr.DataArray        # per-component posteriors, has a {c}_probs axis
-    # per-channel mean-sorted index bgnorm assigned to signal / (tissue) background.
-    # The assignment can flip per channel, so labels/probs are remapped to roles
-    # per channel (the signal component is NOT always the highest-mean one).
+    raw: xr.DataArray # raw, untransformed input, (c, y, x)
+    transformed: xr.DataArray | None # post pre-bgnorm transforms (None if not collected)
+    bgnorm: xr.DataArray # bgnorm output (pre-quantile), (c, y, x)
+    bgnorm_q: xr.DataArray | None # bgnormQ output (None without posthoc)
+    labels: xr.DataArray # argmax mean-sorted component id, (c, y, x)
+    probs: xr.DataArray # per-component posteriors, has a {c}_probs axis
     signal_components: object  # (c,) int array
     background_components: object  # (c,) int array
     channel_dim: str
     n_components: int
-    max_px: int = 128          # per-channel thumbnail longest edge
-    transform_label: str = "transformed"  # the actual pre-bgnorm transforms, e.g. "median + log10"
+    max_px: int = 128 # per-channel thumbnail longest edge
+    transform_label: str = "transformed" # the actual pre-bgnorm transforms, e.g. "median + log10"
 
 
 ChannelPlot = Callable[["ChannelPlotContext"], "Figure"]
 SummaryPlot = Callable[["pd.DataFrame"], "Figure"]
 GridPlot = Callable[["ImageGridContext"], "Figure"]
 
-# Semantic roles in ROLE space (after the per-channel remap below): 0 = background
-# (the lowest-mean component(s)), 1 = tissue background (bgnorm's background_component_),
-# 2 = signal (bgnorm's signal_component_). These are fixed once the per-channel
-# component->role remap is applied, so they are consistent across channels.
+
 ROLE_BACKGROUND, ROLE_TISSUE, ROLE_SIGNAL = 0, 1, 2
 CLASS_ROLES = {ROLE_BACKGROUND: "background", ROLE_TISSUE: "tissue background", ROLE_SIGNAL: "signal"}
 CLASS_COLORS = ["grey", "saddlebrown", "royalblue"]
@@ -75,11 +69,6 @@ def _plt():
 
     return plt
 
-
-# --------------------------------------------------------------------------- #
-# Template plots — working examples. Edit / add your own below and register
-# them in CHANNEL_PLOTS / SUMMARY_PLOTS at the bottom.
-# --------------------------------------------------------------------------- #
 def gmm_fit(ctx: ChannelPlotContext) -> Figure:
     """Histogram of the sampled pixels with the fitted GMM components overlaid —
     reads the core.py `BgNormChannel` (its `.sample_` and `.gmm_`)."""
@@ -135,12 +124,6 @@ def transformed_vs_adjusted(ctx: ChannelPlotContext) -> Figure:
     fig.tight_layout()
     return fig
 
-
-# --------------------------------------------------------------------------- #
-# All-channel image grids (parent-run artifacts). Each cell is one channel,
-# downsampled to `ctx.max_px`. Registered in GRID_PLOTS below; the per-class
-# probability grids are generated dynamically (one per component).
-# --------------------------------------------------------------------------- #
 def _grid_shape(n: int) -> tuple[int, int]:
     import math
 
@@ -279,21 +262,13 @@ def prob_grid(ctx: ImageGridContext, role: int) -> Figure:
     return fig
 
 
-# --------------------------------------------------------------------------- #
-# Registries — map an artifact filename stem to a plot function. Add yours here.
-# --------------------------------------------------------------------------- #
 CHANNEL_PLOTS: dict[str, ChannelPlot] = {
     "gmm_fit": gmm_fit,
     "transformed_vs_adjusted": transformed_vs_adjusted,
 }
 
-# Per-channel scalar metrics (cohens_d, jsd, ...) are charted natively in the
-# MLflow metrics UI, so no redundant summary bar plots are registered by default.
 SUMMARY_PLOTS: dict[str, SummaryPlot] = {}
 
-# Fixed image grids. The bgnormQ grid (only with a posthoc quantile step) and the
-# per-class probability grids ("prob_class{k}") are added dynamically in
-# log_grid_artifacts (their presence / count depend on the pipeline + n_components).
 GRID_PLOTS: dict[str, GridPlot] = {
     "raw": raw_grid,
     "transformed": transformed_grid,
