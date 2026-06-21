@@ -13,7 +13,6 @@ from .core import (
     PostHocQuantile,
     ScoreMetrics,
     bgnorm,
-    bic_model_order,
     default_pipeline,
 )
 from .io import (
@@ -25,7 +24,7 @@ from .io import (
     from_spatialdata,
     from_tiff,
 )
-from .plotting import ChannelPlotContext, ImageGridContext
+from .plotting import ChannelPlotContext, ImageGridContext, bic_model_order_scatter
 from .tracking import MLflowTracker, TrackingConfig
 
 try:
@@ -52,7 +51,7 @@ __all__ = [
     "TrackingConfig",
     "as_image_matrix",
     "bgnorm",
-    "bic_model_order",
+    "bic_model_order_scatter",
     "default_pipeline",
     "from_numpy",
     "from_png",

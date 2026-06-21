@@ -132,34 +132,36 @@ def _jsd_from_pdfs(
 #     return _jsd_from_pdfs(x, p, q, w1, w2)
 
 
-def bic_model_order(
+def _bic_fitness_comparison(
     sample: np.ndarray,
-    k_range: tuple[int, ...] = (1, 2, 3),
+    kmax: int,
+    kmax_gmm: GaussianMixture,
     random_state: int = 42,
 ) -> dict[str, object]:
-    """Per-data-point BIC model order for a 1-D sample.
+    """Per-data-point BIC model order over k = 1 .. kmax for a 1-D sample.
 
-    Fits a GMM for each k in `k_range` and returns the **negated, per-point** BIC
-    (``nbic[k] = -GMM.bic(sample) / n``, so *larger = better* fit) plus the gain of
-    the largest k over each smaller one (``nbic[kmax] - nbic[k]``). A channel that
-    doesn't support the largest k (a flat/dead channel) shows ~0 gain of K=kmax over
-    K=1 — useful for flagging channels that don't fit the assumed component count.
+    Reuses the already-fitted `kmax_gmm` (the channel's n_components fit) for the kmax
+    term — so the kmax model is NOT refit — and fits only k = 1 .. kmax-1. Returns the
+    negated, per-point BIC (``nbic[k] = -GMM.bic(sample) / n``; larger = better) and
+    the gain of kmax over each smaller k (``gains[k] = nbic[kmax] - nbic[k]``).
 
-    Returns ``{"n": int, "nbic": {k: float}, "gains": {k: float}}`` where
-    ``gains[k] = nbic[max(k_range)] - nbic[k]`` for each k != max(k_range).
+    A near-zero gain of kmax over K=1 flags a channel that doesn't support kmax
+    components (a flat/dead channel), useful QC for the assumed component count.
+
+    Returns ``{"n": int, "nbic": {k: float}, "gains": {k: float}}``.
     """
     s = np.asarray(sample, dtype=float).reshape(-1, 1)
     n = s.shape[0]
-    nbic = {}
-    for k in k_range:
+    kmax = int(kmax)
+    nbic = {kmax: -float(kmax_gmm.bic(s)) / n}  # reuse the fitted kmax GMM (no refit)
+    for k in range(1, kmax):
         gmm = GaussianMixture(
-            n_components=int(k), covariance_type="full",
+            n_components=k, covariance_type="full",
             init_params="k-means++", random_state=random_state,
         )
         gmm.fit(s)
-        nbic[int(k)] = -float(gmm.bic(s)) / n  # negated + per-point: larger = better
-    kmax = int(max(k_range))
-    gains = {int(k): nbic[kmax] - nbic[int(k)] for k in k_range if int(k) != kmax}
+        nbic[k] = -float(gmm.bic(s)) / n  # negated + per-point: larger = better fit
+    gains = {k: nbic[kmax] - nbic[k] for k in range(1, kmax)}
     return {"n": n, "nbic": nbic, "gains": gains}
 
 
@@ -235,16 +237,21 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
     background_component_: int
     labels_: np.ndarray
     probabilities_: np.ndarray
+    bic_model_order_: dict  # set in fit() when compute_bic_model_order=True
 
     def __init__(
         self,
         n_components: int = 3, # NOTE: this might become static variable sicne bgnorm core assumption is ncomp=3
         n_pixels_to_sample: int = int(1e5),
         pixel_sampling_seed: int = 0,
+        compute_bic_model_order: bool = False,
     ) -> None:
         self.n_components = n_components
         self.n_pixels_to_sample = n_pixels_to_sample
         self.pixel_sampling_seed = pixel_sampling_seed
+        # if True, fit() also computes the BIC model-order gains over k=1..n_components,
+        # reusing the n_components GMM for kmax (see bic_model_order()).
+        self.compute_bic_model_order = compute_bic_model_order
 
     def fit_transform(self, X: xr.DataArray, y: None = None, **fit_params: object) -> xr.DataArray:
         if hasattr(X, "compute"):
@@ -308,6 +315,9 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
             "weight_signal": gmm.weights_[self.signal_component_],
         }
         self.sample_ = sample  # kept for bic/log-likelihood in score()
+        if self.compute_bic_model_order:
+            # reuse the n_components GMM just fitted (gmm) for kmax — no refit
+            self.bic_model_order_ = _bic_fitness_comparison(sample, self.n_components, gmm)
         return self
 
     def transform(self, X: ImageLike) -> ImageLike:
@@ -365,11 +375,16 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
             "adjustment_scale": mean_gap * float(m["weight_signal"]),
         }
 
-    def bic_model_order(self, k_range: tuple[int, ...] = (1, 2, 3)) -> dict[str, object]:
-        """BIC model order on this channel's fitted sample (see module-level
-        `bic_model_order`). A near-zero gain of K=n_components over K=1 flags a
-        channel that doesn't support the assumed component count."""
-        return bic_model_order(self.sample_, k_range=k_range, random_state=42)
+    def bic_model_order(self) -> dict[str, object]:
+        """Per-point BIC model order over k = 1 .. n_components, reusing the fitted
+        n_components GMM for kmax (so kmax is never refit). Cached on
+        `bic_model_order_`; computed eagerly in fit() when
+        `compute_bic_model_order=True`, otherwise on first call here. A near-zero gain
+        of K=n_components over K=1 flags a channel that doesn't support the assumed
+        component count (e.g. a flat/dead channel)."""
+        if getattr(self, "bic_model_order_", None) is None:
+            self.bic_model_order_ = _bic_fitness_comparison(self.sample_, self.n_components, self.gmm_)
+        return self.bic_model_order_
 
 class PostHocQuantile(BaseEstimator, TransformerMixin):
     """Normalise by the bgnorm-adjusted value of the top component's q-quantile.
@@ -605,7 +620,7 @@ def _run_per_channel(
         datasets.append(xr.Dataset(data_vars))
 
     merged = xr.concat(datasets, dim=channel_dim)
-    # which mean-sorted GMM component is signal vs (tissue) background per channel —
+    # which mean-sorted GMM component is signal vs (tissue) background per channel
     # the assignment can flip per channel, so carry it for role-correct plotting.
     merged = merged.assign_coords(
         signal_component=(channel_dim, np.array(signal_comps, dtype=int)),

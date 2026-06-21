@@ -349,9 +349,8 @@ def log_grid_artifacts(mlflow, ctx: ImageGridContext) -> None:
 
 
 def bic_model_order_scatter(gains, *, k_signal=3, blanks=None, annotate=True):
-    """Annotated per-channel scatter of BIC model-order gains (BIC := -BIC/n, larger
-    = better): x = gain of K=k_signal over K=k_signal-1, y = gain over K=1. Dead/flat
-    channels fall in the bottom-left (both gains ~0).
+    """Annotated per-channel scatter of BIC model-order gains (negBIC = -BIC/n)
+    This represents gain of K=k_signal over K=k_signal-1, y = gain over K=1. 
 
     `gains` is a {channel: gains_dict} mapping, where gains_dict is the "gains" entry
     returned by `bgnorm.bic_model_order` (keys are the smaller k's). `blanks` is an
@@ -370,8 +369,8 @@ def bic_model_order_scatter(gains, *, k_signal=3, blanks=None, annotate=True):
             ax.annotate(str(ch), (x, y), fontsize=5.5, xytext=(3, 2),
                         textcoords="offset points", color="red" if bl else "dimgray")
     ax.axvline(0, color="grey", lw=0.6)
-    ax.set_xlabel(f"BIC{k_signal} - BIC{k_signal - 1}   (BIC := -BIC / n;  larger = better)")
-    ax.set_ylabel(f"BIC{k_signal} - BIC1   (BIC := -BIC / n;  larger = better)")
-    ax.set_title("Per-point BIC model-order gain of the top component (annotated by channel)")
+    ax.set_xlabel(f"negBIC{k_signal} - negBIC{k_signal - 1}")
+    ax.set_ylabel(f"negBIC{k_signal} - negBIC1")
+    ax.set_title("Per-point BIC model-order gain of the top component")
     fig.tight_layout()
     return fig
