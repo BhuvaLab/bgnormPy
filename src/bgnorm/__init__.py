@@ -13,6 +13,7 @@ from .core import (
     PostHocQuantile,
     ScoreMetrics,
     bgnorm,
+    bic_model_order,
     default_pipeline,
 )
 from .io import (
@@ -51,6 +52,7 @@ __all__ = [
     "TrackingConfig",
     "as_image_matrix",
     "bgnorm",
+    "bic_model_order",
     "default_pipeline",
     "from_numpy",
     "from_png",

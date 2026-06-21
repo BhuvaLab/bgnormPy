@@ -346,3 +346,32 @@ def log_grid_artifacts(mlflow, ctx: ImageGridContext) -> None:
         roles["prob_background"] = ROLE_BACKGROUND
     items.update({stem: (lambda c, r=r: prob_grid(c, r)) for stem, r in roles.items()})
     _log_figures(mlflow, items, ctx, kind="grid", subdir="grids")
+
+
+def bic_model_order_scatter(gains, *, k_signal=3, blanks=None, annotate=True):
+    """Annotated per-channel scatter of BIC model-order gains (BIC := -BIC/n, larger
+    = better): x = gain of K=k_signal over K=k_signal-1, y = gain over K=1. Dead/flat
+    channels fall in the bottom-left (both gains ~0).
+
+    `gains` is a {channel: gains_dict} mapping, where gains_dict is the "gains" entry
+    returned by `bgnorm.bic_model_order` (keys are the smaller k's). `blanks` is an
+    optional iterable of channel names to highlight in red.
+    """
+    plt = _plt()
+    blanks = set(blanks or [])
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    for ch, g in gains.items():
+        x, y = g[k_signal - 1], g[1]
+        bl = ch in blanks
+        ax.scatter(x, y, c="red" if bl else "steelblue", s=90 if bl else 28,
+                   marker="X" if bl else "o", zorder=6 if bl else 3,
+                   edgecolors="k" if bl else "none", linewidths=0.6)
+        if annotate:
+            ax.annotate(str(ch), (x, y), fontsize=5.5, xytext=(3, 2),
+                        textcoords="offset points", color="red" if bl else "dimgray")
+    ax.axvline(0, color="grey", lw=0.6)
+    ax.set_xlabel(f"BIC{k_signal} - BIC{k_signal - 1}   (BIC := -BIC / n;  larger = better)")
+    ax.set_ylabel(f"BIC{k_signal} - BIC1   (BIC := -BIC / n;  larger = better)")
+    ax.set_title("Per-point BIC model-order gain of the top component (annotated by channel)")
+    fig.tight_layout()
+    return fig

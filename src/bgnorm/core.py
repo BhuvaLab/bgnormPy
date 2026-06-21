@@ -132,6 +132,37 @@ def _jsd_from_pdfs(
 #     return _jsd_from_pdfs(x, p, q, w1, w2)
 
 
+def bic_model_order(
+    sample: np.ndarray,
+    k_range: tuple[int, ...] = (1, 2, 3),
+    random_state: int = 42,
+) -> dict[str, object]:
+    """Per-data-point BIC model order for a 1-D sample.
+
+    Fits a GMM for each k in `k_range` and returns the **negated, per-point** BIC
+    (``nbic[k] = -GMM.bic(sample) / n``, so *larger = better* fit) plus the gain of
+    the largest k over each smaller one (``nbic[kmax] - nbic[k]``). A channel that
+    doesn't support the largest k (a flat/dead channel) shows ~0 gain of K=kmax over
+    K=1 — useful for flagging channels that don't fit the assumed component count.
+
+    Returns ``{"n": int, "nbic": {k: float}, "gains": {k: float}}`` where
+    ``gains[k] = nbic[max(k_range)] - nbic[k]`` for each k != max(k_range).
+    """
+    s = np.asarray(sample, dtype=float).reshape(-1, 1)
+    n = s.shape[0]
+    nbic = {}
+    for k in k_range:
+        gmm = GaussianMixture(
+            n_components=int(k), covariance_type="full",
+            init_params="k-means++", random_state=random_state,
+        )
+        gmm.fit(s)
+        nbic[int(k)] = -float(gmm.bic(s)) / n  # negated + per-point: larger = better
+    kmax = int(max(k_range))
+    gains = {int(k): nbic[kmax] - nbic[int(k)] for k in k_range if int(k) != kmax}
+    return {"n": n, "nbic": nbic, "gains": gains}
+
+
 class MedianFilter(BaseEstimator, TransformerMixin):
     """radiusxradius (one-connectivity) square median filter over a single channel. """
 
@@ -333,6 +364,12 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
             "signal_var_fraction": float(1.0 - rho),
             "adjustment_scale": mean_gap * float(m["weight_signal"]),
         }
+
+    def bic_model_order(self, k_range: tuple[int, ...] = (1, 2, 3)) -> dict[str, object]:
+        """BIC model order on this channel's fitted sample (see module-level
+        `bic_model_order`). A near-zero gain of K=n_components over K=1 flags a
+        channel that doesn't support the assumed component count."""
+        return bic_model_order(self.sample_, k_range=k_range, random_state=42)
 
 class PostHocQuantile(BaseEstimator, TransformerMixin):
     """Normalise by the bgnorm-adjusted value of the top component's q-quantile.
