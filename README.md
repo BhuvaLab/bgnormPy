@@ -86,12 +86,50 @@ uv sync
 
 ### High-Level Workflow
 
-The easiest way to run a complete GMM normalization workflow with a single function entrypoint:
+The easiest way to run a complete workflow with a single function entrypoint:
+
+- Files: Currently supports .png, .tif, .tiff, .qptiff out of the box.
+- Matrix Data Structures: Numpy arrays, Xarray.DataArrays (recommended to validate with bgnorm.io.ImageSchema.validate)
+- scverse Data Structures: SpatialData.images (Image2DModels; TBA)
 
 ```{python}
+from bgnorm import bgnorm
+
+merged, summaries = bgnorm(
+    "./my_image.png" # filepath to image / matrix
+    channel_name="my_channel_1", # if png or tiff with no channel metadata, can label it here
+    #channel_names=["my_channel_1", "my_channel_2"], # if tiff with multiple channels, parse here instead
+    
+    # bgnorm parameters; below are the defaults
+    median_filter_radius=3, # 3x3 square median filter
+    image_cofactor=150, # used when computing log transform; log(x / cofactor)
+    n_components=3, # core bgnorm assumption is to have thi to 3, do not change
+    n_pixels_to_sample=1e5, # number of pixels used for fitting GMM
+    pixel_sampling_seed=3,
+    quantile_post_hoc_value=0.75, # if non-zero, adds the posthocquantile tranfsorm (bgnormQ) at this quantile
+    compute_bic_model_order=False, # computes GMMs at k=1, .., n_components to compute fitness
+)
 ```
 
-### Scikit-Learn Composition
+`merged` returns an xr.Dataset with
+.adjusted_image (c, y, x) -> bgnormed image
+.adjusted_image_post_hoc (c, y, x) -> bgnormedQ image with posthoc quantile transform
+.labels (c, y, x) -> the component assignments of every pixel for each channel
+.probs (c, c_probs, y, x) -> the prediction probability of each component in each pixel, for each channel
+
+`summaries` returns a pd.DataFrame with model parametrs and statistics (columns), for each channel (rows)
+
+### Advanced Usage
+#### Custom Image Data Structures
+If using your own image data structures, we recommend parsing it to a richly annotated xr.DataArray, with coords `c` for channel dim, etc. You can validate its compatibility with bgnorm by using our pydantic Image schema:
+```{python}
+from bgnorm.io import ImageLikeSchema
+
+img = ... # xarray.DataArray
+img_validated = ImageLikeSchema.validate(img)
+```
+
+#### Scikit-Learn Composition
 BgNorm steps exist as scikit-learn compatible modules and can be used to compose the bgnorm function as a scikit-learn Pipeline. We recommend using the `BgNormConfig` schema to validate parameters:
 
 ```{python}
@@ -128,3 +166,26 @@ steps = [
 pp = Pipeline(steps)
 adjusted_image = pp.fit_transform(...)
 ```
+
+#### MLFlow Experiment Tracking
+BgnormPy supports rich MLFlow integration to track bgnorm runs as experiements to explore the results in a rich UI. The base image is treated as one 'experiment', where each run is a bgnorm call with the given set of parameters. Since each image channel is bgnormed indepdenntly, these are organised as 'subruns'.
+
+```{python}
+# To track experiments, provide a TrackingConfig object to the main function
+from bgnorm import bgnorm, TrackingConfig
+
+merged, summaries = bgnorm(
+    image,
+    channel_dim="c",
+    tracking=TrackingConfig(
+        tracking_uri=None, # or URI to your mlflow server. If none, this will create a local sqlite db as per your MLFlow version
+        image_name="my_image_label" # this will be the base name of your experiment, prepended with '/bgnorm'
+    ),
+    # and your bgnorm params below
+    n_pixels_to_sample=1e5,
+    ...
+)
+```
+
+## Citation
+If you use bgnormPy in your research, please cite: TBA
