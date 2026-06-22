@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, TypedDict
@@ -19,7 +20,7 @@ from .io import ImageLikeSchema, as_image_matrix
 from .tracking import MLflowTracker, TrackingConfig
 
 # type helpers
-ImageLike = xr.DataArray | np.ndarray | da.Array
+ImageLike = xr.DataArray | np.ndarray | da.Array | str | os.PathLike
 PipelineFactory = Callable[[], Pipeline]
 
 
@@ -522,8 +523,9 @@ def bgnorm(
 ) -> tuple[xr.Dataset, pd.DataFrame] | BgNormArrays:
     """Background-normalise a single- or multi-channel image.
 
-    `image` may be an xr.DataArray ((c, y, x) or (y, x)) or a numpy/dask array of
-    shape (y, x) or (c, y, x); it is parsed/validated via `io.as_image_matrix`.
+    `image` may be an xr.DataArray ((c, y, x) or (y, x)), a numpy/dask array of
+    shape (y, x) or (c, y, x), or a path to an image file (.png / .tif / .tiff /
+    .qptiff); it is parsed/validated via `io.as_image_matrix`.
 
     The default pipeline is built from `config=` (a BgNormConfig) overlaid with any
     of the keyword params below that you pass explicitly — they mirror BgNormConfig,
@@ -575,7 +577,7 @@ def bgnorm(
             "compute_bic_model_order": compute_bic_model_order,
         }.items() if v is not _UNSET
     }
-    was_xarray = isinstance(image, xr.DataArray)
+    was_xarray = isinstance(image, (xr.DataArray, str, os.PathLike))
     name = tracking.image_name if tracking is not None else None
     da_img = as_image_matrix(image, channel_dim=channel_dim, name=name)
     single = int(da_img.sizes[channel_dim]) == 1

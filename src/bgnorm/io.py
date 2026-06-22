@@ -78,13 +78,12 @@ def as_image_matrix(
     channel_names: list[str] | None = None,
 ) -> xr.DataArray:
     """Coerce any supported input into a validated bgnorm image matrix.
-
-    This is the single entry point bgnorm uses to parse its `image` argument:
-      * an :class:`xr.DataArray` of any dim order/case (with or without a channel
-        dim) is normalised to ``(channel_dim, y, x)`` and validated;
-      * a numpy/dask array (``(y, x)`` or ``(c, y, x)``) is wrapped, auto-labelling
-        channels when ``channel_names`` is not given so raw arrays stay convenient.
     """
+    if isinstance(image, (str, os.PathLike)):
+        return _from_path(
+            image, channel_dim=channel_dim, name=name, channel_names=channel_names
+        )
+
     if isinstance(image, xr.DataArray):
         resolved = name or (str(image.name) if image.name else "image")
         matrix = _to_cyx(image, channel_dim=channel_dim, name=resolved)
@@ -96,6 +95,35 @@ def as_image_matrix(
     if arr.ndim == 3 and channel_names is None:  # auto-label multichannel arrays
         channel_names = [f"channel_{i}" for i in range(arr.shape[0])]
     return from_numpy(arr, name or "image", channel_names=channel_names, channel_dim=channel_dim)
+
+
+def _from_path(
+    path: os.PathLike | str,
+    *,
+    channel_dim: str = "c",
+    name: str | None = None,
+    channel_names: list[str] | None = None,
+) -> xr.DataArray:
+    """Read an image file into a validated image matrix, dispatched by extension.
+
+    Currently supports .png, .qptiff. .tif/.tiff
+
+    `channel_names` is forwarded to the PNG/TIFF readers; QPTIFF can derive its own
+    channel labels from metadata. Raises on a missing file or unsupported extension.
+    """
+    p = os.fspath(path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"image path does not exist: {p}")
+    low = p.lower()
+    if low.endswith(".png"):
+        return from_png(path, name, channel_names=channel_names, channel_dim=channel_dim)
+    if low.endswith(".qptiff"):
+        return from_qptiff(path, channel_dim=channel_dim, name=name)
+    if low.endswith((".tif", ".tiff")):
+        return from_tiff(path, name, channel_names=channel_names, channel_dim=channel_dim)
+    raise ValueError(
+        f"unsupported image extension for {p!r}; supported: .png, .tif/.tiff, .qptiff"
+    )
 
 
 def _channel_labels(
