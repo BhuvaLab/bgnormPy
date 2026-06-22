@@ -29,6 +29,10 @@ qptiff = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# allow the direct git reference for `qptiff` optional dep
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/bgnorm"]
 

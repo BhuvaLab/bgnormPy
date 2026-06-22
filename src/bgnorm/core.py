@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, TypedDict
+from typing import Any, Callable, TypedDict
 
 import numpy as np
 import dask.array as da
@@ -23,6 +23,17 @@ ImageLike = xr.DataArray | np.ndarray | da.Array
 PipelineFactory = Callable[[], Pipeline]
 
 
+class _Unset:
+    """Sentinel for bgnorm() keyword params: distinguishes 'not passed' from an
+    explicit value, so a base `config=` is only overridden by params the caller
+    actually sets (defaults still come from BgNormConfig)."""
+    def __repr__(self) -> str:
+        return "DEFAULT"
+
+
+_UNSET: Any = _Unset()
+
+
 class BgNormConfig(BaseModel):
     """Validated, user-facing parameters for the bgnorm pipeline."""
     # TODO: yaml parser for larger experiement sweeps
@@ -35,6 +46,10 @@ class BgNormConfig(BaseModel):
     pixel_sampling_seed: int = Field(0, ge=0, description="Seed for pixel sampling.")
     quantile_post_hoc_value: float | None = Field(
         0.75, gt=0, lt=1, description="If set, append PostHocQuantile(q); else omit it."
+    )
+    compute_bic_model_order: bool = Field(
+        False, description="If True, also compute per-channel BIC model-order gains "
+        "(k=1..n_components, reusing the n_components fit) during fit."
     )
 
 
@@ -55,6 +70,10 @@ class Moments(TypedDict):
 
 class ScoreMetrics(TypedDict):
     """Per-channel goodness-of-fit + method-validity metrics.
+
+    When `compute_bic_model_order=True`, score() also adds dynamic
+    `bic_gain_{n_components}v{k}` keys (the per-point BIC gain of K=n_components over
+    each smaller k), e.g. `bic_gain_3v1`, `bic_gain_3v2`.
     """
     cohens_d: float
     jsd: float           
@@ -331,7 +350,8 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
         )
         adjusted = (expected * probs[:, self.signal_component_]).clip(min=0)
 
-        self.labels_ = np.argmax(probs, axis=1).reshape(X.shape).astype(np.int32)
+        # can be compressed to int8; 0 to 255 components
+        self.labels_ = np.argmax(probs, axis=1).reshape(X.shape).astype(np.uint8)
         self.probabilities_ = probs.reshape(X.shape + (probs.shape[1],)).astype(np.float32)
 
         # mainly for PostHocQuantile if used
@@ -362,6 +382,14 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
 
 
         rho = float(self.rho_)
+        # bic_gain_{kmax}v{k} = nbic[kmax] - nbic[k], kmax = n_components.
+        bic_gains = {}
+        if self.compute_bic_model_order:
+            kmax = self.n_components
+            bic_gains = {
+                f"bic_gain_{kmax}v{k}": float(g)
+                for k, g in self.bic_model_order()["gains"].items()
+            }
         return {
             "cohens_d": float(cohens_d),
             "jsd": float(jsd),
@@ -373,6 +401,7 @@ class BgNormChannel(BaseEstimator, TransformerMixin):
             "conv_violated": float(rho < 0),
             "signal_var_fraction": float(1.0 - rho),
             "adjustment_scale": mean_gap * float(m["weight_signal"]),
+            **bic_gains,
         }
 
     def bic_model_order(self) -> dict[str, object]:
@@ -439,7 +468,10 @@ def default_pipeline(config: BgNormConfig | None = None, **overrides: object) ->
     steps: list[tuple[str, BaseEstimator]] = [
         ("median", MedianFilter(cfg.median_filter_radius)),
         ("log2", Log2Transform(cfg.image_cofactor)),
-        ("bgnorm", BgNormChannel(cfg.n_components, cfg.n_pixels_to_sample, cfg.pixel_sampling_seed)),
+        ("bgnorm", BgNormChannel(
+            cfg.n_components, cfg.n_pixels_to_sample, cfg.pixel_sampling_seed,
+            compute_bic_model_order=cfg.compute_bic_model_order,
+        )),
     ]
     if cfg.quantile_post_hoc_value is not None:
         steps.append(("posthoc", PostHocQuantile(cfg.quantile_post_hoc_value)))
@@ -479,23 +511,70 @@ def bgnorm(
     channel_dim: str = "c",
     config: BgNormConfig | None = None,
     *,
+    median_filter_radius: int = _UNSET,
+    image_cofactor: int = _UNSET,
+    n_components: int = _UNSET,
+    n_pixels_to_sample: int = _UNSET,
+    pixel_sampling_seed: int = _UNSET,
+    quantile_post_hoc_value: float | None = _UNSET,
+    compute_bic_model_order: bool = _UNSET,
     tracking: TrackingConfig | None = None,
-    **overrides: object,
 ) -> tuple[xr.Dataset, pd.DataFrame] | BgNormArrays:
     """Background-normalise a single- or multi-channel image.
 
-    `image` may be an xr.DataArray ((c, y, x) or (y, x)) or a numpy/dask array
-    of shape (y, x) or (c, y, x). It is parsed into the canonical bgnorm image
-    matrix and validated via `io.as_image_matrix` / `ImageLikeSchema`. Pass a
-    custom `pipeline=` to run an experiment composition; otherwise a
-    `default_pipeline` is built from `config=` / keyword overrides.
+    `image` may be an xr.DataArray ((c, y, x) or (y, x)) or a numpy/dask array of
+    shape (y, x) or (c, y, x); it is parsed/validated via `io.as_image_matrix`.
 
-    Pass `tracking=TrackingConfig(...)` to log to MLflow: a parent run per
-    parameter setting, with one nested run per channel carrying its ScoreMetrics.
+    The default pipeline is built from `config=` (a BgNormConfig) overlaid with any
+    of the keyword params below that you pass explicitly — they mirror BgNormConfig,
+    so they autocomplete and show up in help(). Pass a custom `pipeline=` to run your
+    own composition (config / keyword params are then ignored).
 
-    Returns (xr.Dataset, summaries) for DataArray input, or a BgNormArrays for
-    array input (rank matched to what was passed in).
+    Parameters
+    ----------
+    image : xr.DataArray | np.ndarray | dask.array
+        (c, y, x) or (y, x) input.
+    pipeline : sklearn Pipeline, optional
+        Custom composition; overrides the config-built default_pipeline.
+    channel_dim : str
+        Name of the channel axis (default "c").
+    config : BgNormConfig, optional
+        Base parameter set; any explicit keyword below overrides it.
+    median_filter_radius : int
+        Square median-filter radius, px (default 3).
+    image_cofactor : int
+        Divisor in log2(x / cofactor + 1) (default 150).
+    n_components : int
+        GMM components (default 3: background / tissue background / signal).
+    n_pixels_to_sample : int
+        Positive pixels sampled to fit the GMM (default 100000).
+    pixel_sampling_seed : int
+        Seed for the pixel sample (default 0).
+    quantile_post_hoc_value : float | None
+        If in (0, 1), append PostHocQuantile(q) (default 0.75); None disables it.
+    compute_bic_model_order : bool
+        Also compute per-channel BIC model-order gains during fit (default False).
+    tracking : TrackingConfig, optional
+        If given, log the run to MLflow (parent run per parameter setting, nested
+        run per channel with ScoreMetrics + plots/grids).
+
+    Returns
+    -------
+    (xr.Dataset, summaries) for DataArray input, or a BgNormArrays for array input
+    (rank matched to the input).
     """
+    # only the params the caller actually set become overrides on the base config
+    overrides = {
+        k: v for k, v in {
+            "median_filter_radius": median_filter_radius,
+            "image_cofactor": image_cofactor,
+            "n_components": n_components,
+            "n_pixels_to_sample": n_pixels_to_sample,
+            "pixel_sampling_seed": pixel_sampling_seed,
+            "quantile_post_hoc_value": quantile_post_hoc_value,
+            "compute_bic_model_order": compute_bic_model_order,
+        }.items() if v is not _UNSET
+    }
     was_xarray = isinstance(image, xr.DataArray)
     name = tracking.image_name if tracking is not None else None
     da_img = as_image_matrix(image, channel_dim=channel_dim, name=name)
