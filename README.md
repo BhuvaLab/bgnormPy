@@ -124,9 +124,18 @@ merged, summaries = bgnorm(
 If using your own image data structures, we recommend parsing it to a richly annotated xr.DataArray, with coords `c` for channel dim, etc. You can validate its compatibility with bgnorm by using our pydantic Image schema:
 ```python
 from bgnorm.io import ImageLikeSchema
+from bgnorm import bgnorm
 
 img = ... # xarray.DataArray
 img_validated = ImageLikeSchema.validate(img)
+
+# then parse to above function
+merged, summaries = bgnorm(
+    img_validated,
+    ...
+)
+
+# or to advanced usage below
 ```
 
 #### Scikit-Learn Composition
@@ -164,7 +173,7 @@ steps = [
 ]
 
 pp = Pipeline(steps)
-adjusted_image = pp.fit_transform(...)
+adjusted_image = pp.fit_transform(img_validated)
 ```
 
 #### MLFlow Experiment Tracking
