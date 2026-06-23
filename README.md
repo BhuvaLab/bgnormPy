@@ -92,7 +92,7 @@ The easiest way to run a complete workflow with a single function entrypoint:
 - Matrix Data Structures: Numpy arrays, Xarray.DataArrays (recommended to validate with bgnorm.io.ImageSchema.validate)
 - scverse Data Structures: SpatialData.images (Image2DModels; TBA)
 
-```{python}
+```python
 from bgnorm import bgnorm
 
 merged, summaries = bgnorm(
@@ -122,7 +122,7 @@ merged, summaries = bgnorm(
 ### Advanced Usage
 #### Custom Image Data Structures
 If using your own image data structures, we recommend parsing it to a richly annotated xr.DataArray, with coords `c` for channel dim, etc. You can validate its compatibility with bgnorm by using our pydantic Image schema:
-```{python}
+```python
 from bgnorm.io import ImageLikeSchema
 
 img = ... # xarray.DataArray
@@ -132,7 +132,7 @@ img_validated = ImageLikeSchema.validate(img)
 #### Scikit-Learn Composition
 BgNorm steps exist as scikit-learn compatible modules and can be used to compose the bgnorm function as a scikit-learn Pipeline. We recommend using the `BgNormConfig` schema to validate parameters:
 
-```{python}
+```python
 from bgnorm import (
     BgNormConfig,
     MedianFilter,
@@ -170,7 +170,7 @@ adjusted_image = pp.fit_transform(...)
 #### MLFlow Experiment Tracking
 BgnormPy supports rich MLFlow integration to track bgnorm runs as experiements to explore the results in a rich UI. The base image is treated as one 'experiment', where each run is a bgnorm call with the given set of parameters. Since each image channel is bgnormed indepdenntly, these are organised as 'subruns'.
 
-```{python}
+```python
 # To track experiments, provide a TrackingConfig object to the main function
 from bgnorm import bgnorm, TrackingConfig
 
