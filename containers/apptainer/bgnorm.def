@@ -1,0 +1,18 @@
+# for direct apptainer builds
+
+# apptainer build ./bgnorm.def bgnorm.sif
+# apptainer run --bind {your binds} bgnorm.sif python -c "import bgnorm; print('ok')"
+# or 
+# apptainer shell --bind {your binds} bgnorm.sif 
+
+Bootstrap: docker
+From: ghcr.io/bhuvalab/bgnorm:v0.1.0
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+
+%runscript
+    exec "$@"
+
+%labels
+    org.opencontainers.image.title bgnorm
